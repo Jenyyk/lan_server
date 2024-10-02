@@ -1,8 +1,11 @@
 use actix_files as fs;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, cookie::Cookie, HttpRequest};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs::read_dir;
+use dotenv::dotenv; // Import dotenv
+use std::env; // Import std::env
 
 // Structure for directory entries
 #[derive(Serialize)]
@@ -12,7 +15,13 @@ struct DirectoryEntry {
 }
 
 // Function to handle directory listing
-async fn list_directory(path: web::Path<String>) -> impl Responder {
+async fn list_directory(path: web::Path<String>, req: HttpRequest) -> impl Responder {
+    // Check for valid session (simple login check)
+    let cookie = req.cookie("auth");
+    if cookie.is_none() || cookie.unwrap().value() != "secret" {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+
     // If the path is empty, serve the current directory (".")
     let dir_path = if path.is_empty() {
         PathBuf::from(".")
@@ -50,14 +59,17 @@ async fn index() -> impl Responder {
     <!DOCTYPE html>
     <html lang="en">
     <head>
+        <link rel="stylesheet" href="assets/styles.css">
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Interactive Directory Listing</title>
+        <title>Lan Server</title>
         <script>
             async function fetchDirectory(path = '') {
                 try {
-                    const response = await fetch(`/list/${path}`);
-                    
+                    const response = await fetch(`/list/${path}`, {
+                        credentials: 'include' // Include cookies for auth
+                    });
+
                     if (!response.ok) {
                         throw new Error(`HTTP error! status: ${response.status}`);
                     }
@@ -67,20 +79,17 @@ async fn index() -> impl Responder {
                     const listContainer = document.getElementById("directory-list");
                     listContainer.innerHTML = "";
 
-                    // Add a 'Back' button if we're not at the root
-                    if (path !== '') {
-                        const parentPath = path.split('/').slice(0, -2).join('/') + '/';
-                        const backButton = document.createElement("div");
-                        backButton.innerHTML = "<button>Back</button>";
-                        backButton.onclick = () => fetchDirectory(parentPath);
-                        listContainer.appendChild(backButton);
-                    }
+                    const parentPath = path.split('/').slice(0, -2).join('/') + '/';
+                    const backButton = document.createElement("div");
+                    backButton.innerHTML = "<button>Back</button>";
+                    backButton.onclick = () => fetchDirectory(parentPath || '');
+                    listContainer.appendChild(backButton);
 
                     data.forEach(entry => {
                         const listItem = document.createElement("div");
                         if (entry.is_dir) {
                             // Directories are clickable to navigate into
-                            listItem.innerHTML = `<strong>${entry.name}</strong>`;
+                            listItem.innerHTML = `<strong>${entry.name}/</strong>`;
                             listItem.style.cursor = "pointer";
                             listItem.onclick = () => fetchDirectory(`${path}${entry.name}/`);
                         } else {
@@ -111,10 +120,55 @@ async fn index() -> impl Responder {
         .body(html_content)
 }
 
+// Function to handle login
+async fn login(req: HttpRequest) -> impl Responder {
+    let username = req.match_info().get("username").unwrap_or("");
+    let password = req.match_info().get("password").unwrap_or("");
+
+    // Log incoming username and password (for debugging)
+    println!("Login attempt: {} / {}", username, password);
+
+    // Load user credentials from environment variables
+    let users = env::var("USERS").unwrap_or_else(|_| "admin:password".to_string());
+
+    // Parse users into a HashMap
+    let mut credentials = HashMap::new();
+    for user in users.split(",") {
+        let parts: Vec<&str> = user.split(':').collect();
+        if parts.len() == 2 {
+            credentials.insert(parts[0], parts[1]);
+        }
+    }
+
+    // Check credentials against the parsed HashMap
+    if let Some(&expected_password) = credentials.get(username) {
+        if password == expected_password {
+            // Create a session cookie that expires when the browser is closed
+            let mut cookie = Cookie::new("auth", "secret");
+            cookie.set_http_only(true);
+            cookie.set_path("/"); // Set path for the cookie
+            cookie.set_same_site(actix_web::cookie::SameSite::Strict); // SameSite attribute
+
+            // Do not set an expiration date, making it a session cookie
+            return HttpResponse::SeeOther()
+                .cookie(cookie)
+                .header("Location", "/") // Redirect to the root
+                .finish();
+        }
+    }
+
+    HttpResponse::Unauthorized().body("Invalid credentials")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    println!("starting server on port 8080");
+    dotenv().ok(); // Load environment variables from .env file
+
     HttpServer::new(|| {
         App::new()
+            // Route for the login (username and password are passed in the URL)
+            .route("/login/{username}/{password}", web::get().to(login))
             // Serve the root URL with the HTML content
             .route("/", web::get().to(index))
             // Route for fetching the directory listing as JSON
@@ -122,7 +176,7 @@ async fn main() -> std::io::Result<()> {
             // Serve files to make them downloadable
             .service(fs::Files::new("/", ".").show_files_listing())
     })
-    .bind("127.0.0.1:8080")?
+    .bind("0.0.0.0:8080")?
     .run()
     .await
 }
